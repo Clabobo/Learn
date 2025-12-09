@@ -329,18 +329,20 @@ Handler 有多种构造方法，每种都有不同的使用场景和注意事项
 // Handler.java
 public Handler() {
     this(Looper.myLooper(), false);
+    // 如果 myLooper() 返回 null，会在下面的构造方法中抛出异常
 }
 
 public Handler(@NonNull Looper looper, boolean async) {
     mLooper = looper;
-    mQueue = looper.mQueue;
+    mQueue = looper.mQueue;  // 如果 looper 为 null，这里会抛出 NullPointerException
     mAsynchronous = async;
 }
 ```
 
 **工作原理**：
 - 调用 `Looper.myLooper()` 获取**当前线程**的 Looper
-- 如果当前线程没有 Looper，会抛出异常
+- 如果当前线程没有 Looper（`myLooper()` 返回 `null`），会在构造方法中抛出异常
+- 实际源码中，`Handler(Looper looper, boolean async)` 会检查 `looper` 是否为 `null`，如果为 `null` 会抛出 `RuntimeException`
 
 **主线程 vs 子线程**：
 ```java
@@ -698,27 +700,31 @@ private void removeAllFutureMessagesLocked() {
     Message p = mMessages;
     if (p != null) {
         if (p.when > now) {
-            // 所有消息都是未来消息，全部移除
+            // 场景 1：队头消息就是未来消息，说明所有消息都是未来消息
+            // 全部移除（包括队头）
             removeAllMessagesLocked();
         } else {
-            // 保留当前消息，移除未来消息
+            // 场景 2：队头消息是当前或过去消息，需要保留
+            // 遍历链表，找到第一个未来消息的位置
             Message n;
             for (;;) {
                 n = p.next;
                 if (n == null) {
+                    // 没有未来消息，所有消息都保留
                     return;
                 }
                 if (n.when > now) {
-                    break;  // 找到第一个未来消息
+                    break;  // 找到第一个未来消息 n
                 }
-                p = n;
+                p = n;  // 继续遍历，p 指向当前消息
             }
+            // 断开链表：p.next 指向第一个未来消息，将其设为 null
             p.next = null;
-            // 移除所有未来消息
+            // 移除所有未来消息（从 n 开始的所有消息）
             do {
                 p = n;
                 n = p.next;
-                p.recycleUnchecked();
+                p.recycleUnchecked();  // 回收消息对象
             } while (n != null);
         }
     }
@@ -1048,21 +1054,227 @@ graph LR
     style M2 fill:#0f0,stroke:#333
 ```
 
-### 4.2 核心场景：UI 绘制
+### 4.2 同步屏障的实现细节
+
+#### 4.2.1 postSyncBarrier() 方法实现
+
+`postSyncBarrier()` 用于在消息队列中插入一个同步屏障，返回一个 token（用于后续移除屏障）。
+
+```java
+// MessageQueue.java
+public int postSyncBarrier() {
+    return postSyncBarrier(SystemClock.uptimeMillis());
+}
+
+private int postSyncBarrier(long when) {
+    // 1. 加锁，保证线程安全
+    synchronized (this) {
+        // 2. 生成唯一的 token（自增计数器）
+        final int token = mNextBarrierToken++;
+        
+        // 3. 从消息池中获取一个 Message 对象
+        final Message msg = Message.obtain();
+        msg.markInUse();  // 标记为使用中
+        msg.when = when;  // 设置时间戳
+        msg.arg1 = token;  // 将 token 存储在 arg1 中，用于后续移除
+        
+        // 4. 关键：target 设置为 null，这是同步屏障的标志
+        //    在 next() 方法中，target == null 的消息会被识别为同步屏障
+        msg.target = null;
+        
+        // 5. 将屏障消息按时间顺序插入到消息链表中
+        Message prev = null;
+        Message p = mMessages;
+        
+        // 5.1 如果队列为空，或者屏障时间最早，插入到队头
+        if (when != 0) {
+            // 遍历链表，找到合适的位置（按 when 时间排序）
+            while (p != null && p.when <= when) {
+                prev = p;
+                p = p.next;
+            }
+        }
+        
+        // 5.2 插入屏障消息到链表中
+        if (prev != null) {
+            // 插入到链表中间
+            msg.next = p;
+            prev.next = msg;
+        } else {
+            // 插入到队头
+            msg.next = p;
+            mMessages = msg;
+        }
+        
+        // 6. 返回 token，用于后续移除屏障
+        return token;
+    }
+}
+```
+
+**关键实现点**：
+
+1. **token 生成**：
+   - 使用 `mNextBarrierToken++` 生成唯一标识
+   - token 存储在 `Message.arg1` 中，用于后续移除屏障
+
+2. **屏障标志**：
+   - `msg.target = null` 是同步屏障的核心标志
+   - 在 `next()` 方法中，通过检查 `target == null` 来识别屏障
+
+3. **插入位置**：
+   - 屏障消息按 `when` 时间戳插入链表
+   - 如果 `when == 0`，插入到队头（立即生效）
+   - 如果 `when > 0`，按时间顺序插入
+
+4. **线程安全**：
+   - 所有操作都在 `synchronized` 块中执行
+   - 保证多线程环境下的安全性
+
+#### 4.2.2 removeSyncBarrier() 方法实现
+
+`removeSyncBarrier()` 用于移除指定的同步屏障，恢复同步消息的处理。
+
+```java
+// MessageQueue.java
+public void removeSyncBarrier(int token) {
+    // 1. 加锁，保证线程安全
+    synchronized (this) {
+        Message prev = null;
+        Message p = mMessages;
+        
+        // 2. 遍历消息链表，查找匹配的屏障消息
+        //    屏障消息的特征：target == null && arg1 == token
+        while (p != null && (p.target != null || p.arg1 != token)) {
+            prev = p;
+            p = p.next;
+        }
+        
+        // 3. 如果没找到匹配的屏障，直接返回
+        if (p == null) {
+            throw new IllegalStateException("The specified message queue synchronization "
+                    + " barrier token has not been posted or has already been removed.");
+        }
+        
+        // 4. 检查是否需要唤醒阻塞的 next() 方法
+        boolean needWake = false;
+        
+        // 4.1 如果屏障不在队头，通常不需要唤醒
+        //     因为 next() 方法会继续处理后面的消息
+        if (prev != null) {
+            // 屏障在链表中间，移除后不需要唤醒
+            prev.next = p.next;
+            needWake = false;
+        } else {
+            // 4.2 如果屏障在队头，移除后需要检查是否需要唤醒
+            mMessages = p.next;
+            // 如果队列不为空，且 Looper 当前处于阻塞状态，需要唤醒
+            needWake = mMessages == null || mMessages.target != null;
+        }
+        
+        // 5. 回收屏障消息对象
+        p.recycleUnchecked();
+        
+        // 6. 如果需要唤醒，调用 Native 方法唤醒阻塞的线程
+        if (needWake) {
+            nativeWake(mPtr);
+        }
+    }
+}
+```
+
+**关键实现点**：
+
+1. **屏障查找**：
+   - 通过 `target == null && arg1 == token` 来定位屏障消息
+   - 遍历整个链表，找到匹配的屏障
+
+2. **唤醒判断**：
+   - 如果屏障在队头，移除后需要检查是否需要唤醒
+   - 如果队列为空或下一个消息是同步消息，需要唤醒 `next()` 方法
+
+3. **错误处理**：
+   - 如果没找到匹配的屏障，抛出 `IllegalStateException`
+   - 防止重复移除或移除不存在的屏障
+
+4. **内存管理**：
+   - 移除屏障后，调用 `recycleUnchecked()` 回收消息对象
+   - 防止内存泄漏
+
+#### 4.2.3 同步屏障的工作流程
+
+```mermaid
+sequenceDiagram
+    participant App as 应用代码
+    participant MQ as MessageQueue
+    participant Looper as Looper
+    
+    App->>MQ: postSyncBarrier()
+    Note over MQ: 创建 target=null 的消息<br/>插入到链表中
+    MQ-->>App: 返回 token
+    
+    Note over Looper: next() 方法执行
+    Looper->>MQ: next()
+    MQ->>MQ: 检查队头消息
+    alt 遇到同步屏障 (target == null)
+        MQ->>MQ: 跳过所有同步消息
+        MQ->>MQ: 查找第一个异步消息
+        MQ-->>Looper: 返回异步消息
+    else 没有屏障
+        MQ-->>Looper: 返回同步消息
+    end
+    
+    App->>MQ: removeSyncBarrier(token)
+    Note over MQ: 查找并移除屏障<br/>回收消息对象
+    MQ->>MQ: nativeWake() (如果需要)
+    Note over Looper: 恢复处理同步消息
+```
+
+#### 4.2.4 源码中的关键数据结构
+
+```java
+// MessageQueue.java
+private int mNextBarrierToken;  // 屏障 token 计数器，每次插入屏障时自增
+
+// Message.java
+public Handler target;  // 目标 Handler，null 表示同步屏障
+public int arg1;        // 存储屏障 token
+public long when;       // 消息执行时间戳
+```
+
+#### 4.2.5 注意事项
+
+1. **必须配对使用**：
+   - 每次调用 `postSyncBarrier()` 后，必须调用 `removeSyncBarrier(token)`
+   - 忘记移除会导致同步消息永远无法执行
+
+2. **线程安全**：
+   - 两个方法都是线程安全的，可以在任何线程调用
+   - 但通常在主线程使用（系统内部）
+
+3. **性能影响**：
+   - 插入和移除屏障都是 O(n) 操作（需要遍历链表）
+   - 但实际使用频率很低，性能影响可忽略
+
+4. **API 限制**：
+   - Android 9.0 (API 28) 及以上版本，这些方法是隐藏 API
+   - 需要通过反射调用，普通应用不建议使用
+
+### 4.4 核心场景：UI 绘制
 Android 系统为了保证 UI 流畅，在 `Choreographer` 请求 Vsync 信号时，会发送一个 **同步屏障**。
 1.  **VSync 到来**: 系统向主线程发送 Vsync 信号。
-2.  **插入屏障**: `ViewRootImpl` 往队列插入屏障。
+2.  **插入屏障**: `ViewRootImpl` 往队列插入屏障（调用 `postSyncBarrier()`）。
 3.  **优先处理**: 此时队列中只有 `Asynchronous` 消息（如 `doFrame` 绘制任务）会被处理，普通的 Handler 消息被暂停。
-4.  **移除屏障**: 绘制完成后，移除屏障，恢复普通消息处理。
+4.  **移除屏障**: 绘制完成后，移除屏障（调用 `removeSyncBarrier(token)`），恢复普通消息处理。
 
 > [!WARNING]
 > **开发陷阱**: 如果你反射调用了 `postSyncBarrier` 但忘记 `removeSyncBarrier`，主线程的普通消息将永远无法执行（看起来像假死），只有异步消息能跑。
 
-### 4.3 异步消息与异步 Handler
+### 4.5 异步消息与异步 Handler
 
 同步屏障的作用是拦截同步消息，优先执行异步消息。那么如何创建异步消息呢？
 
-#### 4.3.1 Message.setAsynchronous()
+#### 4.5.1 Message.setAsynchronous()
 
 ```java
 // Message.java
@@ -1087,7 +1299,7 @@ msg.setAsynchronous(true);  // 标记为异步
 handler.sendMessage(msg);
 ```
 
-#### 4.3.2 异步 Handler 的创建
+#### 4.5.2 异步 Handler 的创建
 
 通过异步 Handler 发送的消息会自动标记为异步：
 
@@ -1111,6 +1323,11 @@ private boolean enqueueMessage(MessageQueue queue, Message msg, long uptimeMilli
 ```
 
 **创建异步 Handler**（需要反射，因为 API 隐藏）：
+
+> **版本说明**：
+> - `Handler(Looper, Callback, boolean)` 构造方法在 Android 6.0 (API 23) 及以上版本可用
+> - 异步 Handler 主要用于系统内部，普通应用很少需要
+
 ```java
 // 方式 1：使用反射创建异步 Handler
 try {
@@ -1129,27 +1346,47 @@ try {
 }
 ```
 
-#### 4.3.3 异步消息的作用
+#### 4.5.3 异步消息的作用
 
 **配合同步屏障使用**：
+
+> **版本说明**：
+> - `Looper.myQueue()` 和 `postSyncBarrier()` / `removeSyncBarrier()` 在 Android 9.0 (API 28) 及以上版本是隐藏 API，需要通过反射调用
+> - 普通应用不建议使用同步屏障，主要用于系统内部（如 Choreographer）
+
 ```java
-// 1. 插入同步屏障
-int token = Looper.myQueue().postSyncBarrier();
+// 注意：以下代码需要反射调用，因为相关 API 在 Android 9.0+ 是隐藏的
 
-// 2. 发送异步消息（可以穿透屏障）
-Message asyncMsg = Message.obtain();
-asyncMsg.setAsynchronous(true);
-handler.sendMessage(asyncMsg);
-
-// 3. 发送同步消息（被屏障拦截）
-handler.sendMessage(Message.obtain());
-
-// 4. 此时只有异步消息会被处理
-// 5. 移除屏障后，同步消息才能处理
-Looper.myQueue().removeSyncBarrier(token);
+// 1. 插入同步屏障（通过反射）
+MessageQueue queue = null;
+try {
+    Method myQueue = Looper.class.getDeclaredMethod("myQueue");
+    myQueue.setAccessible(true);
+    queue = (MessageQueue) myQueue.invoke(Looper.getMainLooper());
+    
+    Method postSyncBarrier = MessageQueue.class.getDeclaredMethod("postSyncBarrier");
+    postSyncBarrier.setAccessible(true);
+    int token = (Integer) postSyncBarrier.invoke(queue);
+    
+    // 2. 发送异步消息（可以穿透屏障）
+    Message asyncMsg = Message.obtain();
+    asyncMsg.setAsynchronous(true);
+    handler.sendMessage(asyncMsg);
+    
+    // 3. 发送同步消息（被屏障拦截）
+    handler.sendMessage(Message.obtain());
+    
+    // 4. 此时只有异步消息会被处理
+    // 5. 移除屏障后，同步消息才能处理
+    Method removeSyncBarrier = MessageQueue.class.getDeclaredMethod("removeSyncBarrier", int.class);
+    removeSyncBarrier.setAccessible(true);
+    removeSyncBarrier.invoke(queue, token);
+} catch (Exception e) {
+    e.printStackTrace();
+}
 ```
 
-#### 4.3.4 实际应用场景
+#### 4.5.4 实际应用场景
 
 **系统内部使用**：
 - **Choreographer**：UI 绘制相关的消息使用异步消息，确保优先执行
@@ -1415,6 +1652,7 @@ public final boolean sendMessageDelayed(Message msg, long delayMillis) {
 - 使用 `SystemClock.uptimeMillis()` 而非 `System.currentTimeMillis()`
 - `uptimeMillis()` 不受系统时间调整影响（如用户修改系统时间）
 - 延迟时间 = `SystemClock.uptimeMillis() + delayMillis`
+- **重要**：`postDelayed` 只是将消息的 `when` 字段设置为未来时间，实际执行时间取决于消息队列的积压情况
 
 #### 6.7.2 为什么不精确？
 
@@ -1447,52 +1685,179 @@ handler.postDelayed(() -> {
 }, 1000);  // 实际可能 5 秒后执行
 ```
 
-#### 6.7.3 源码分析：消息时间判断
+#### 6.7.3 源码分析：消息时间判断（完整实现）
+
+以下是 `MessageQueue.next()` 的完整实现，包含所有关键逻辑：
 
 ```java
-// MessageQueue.java
+// MessageQueue.java（完整实现）
 Message next() {
+    // 1. pendingIdleHandlerCount 用于记录待处理的 IdleHandler 数量
+    //    -1 表示还未计算，需要计算一次
+    //    0 表示没有 IdleHandler 或已经处理完
+    //    >0 表示还有待处理的 IdleHandler
+    int pendingIdleHandlerCount = -1;
+    
+    // 2. nextPollTimeoutMillis 表示下次阻塞的超时时间（毫秒）
+    //    -1 表示无限阻塞，直到被唤醒
+    //    0 表示不阻塞，立即返回
+    //    >0 表示阻塞指定毫秒数
+    int nextPollTimeoutMillis = 0;
+    
+    // 3. 无限循环，直到找到可执行的消息或队列退出
     for (;;) {
+        // 4. 调用 Native 方法阻塞等待
+        //    如果没有消息或消息时间未到，线程会在这里进入休眠状态
+        //    当有新消息入队时，会通过 nativeWake() 唤醒
         nativePollOnce(ptr, nextPollTimeoutMillis);
         
+        // 5. 加锁，保证线程安全（多生产者、单消费者模型）
         synchronized (this) {
+            // 6. 获取当前时间（系统启动后的毫秒数，不受系统时间调整影响）
             final long now = SystemClock.uptimeMillis();
             Message prevMsg = null;
             Message msg = mMessages;
             
+            // 7. 检查队列是否已退出
+            if (mQuitting) {
+                // 队列已退出，回收所有消息并返回 null
+                dispose();
+                return null;
+            }
+            
+            // 8. 处理同步屏障（target == null 表示同步屏障）
             if (msg != null && msg.target == null) {
-                // 同步屏障，查找异步消息
+                // 8.1 遇到同步屏障，需要跳过所有同步消息，查找第一个异步消息
                 do {
                     prevMsg = msg;
                     msg = msg.next;
                 } while (msg != null && !msg.isAsynchronous());
+                // 循环结束后，msg 指向第一个异步消息（如果存在）
             }
             
+            // 9. 处理找到的消息
             if (msg != null) {
+                // 9.1 检查消息是否到了执行时间
                 if (now < msg.when) {
-                    // 消息时间未到，计算等待时间
+                    // 消息时间未到，计算需要等待的时间
                     nextPollTimeoutMillis = (int) Math.min(msg.when - now, Integer.MAX_VALUE);
                 } else {
-                    // 消息时间到了，返回消息
+                    // 9.2 消息时间到了，可以执行
+                    // 标记当前未阻塞（有消息可处理）
                     mBlocked = false;
+                    
+                    // 9.3 从链表中移除该消息
                     if (prevMsg != null) {
+                        // 如果 prevMsg 不为 null，说明跳过了同步屏障或前面的消息
                         prevMsg.next = msg.next;
                     } else {
+                        // 如果 prevMsg 为 null，说明这是队头消息
                         mMessages = msg.next;
                     }
+                    
+                    // 9.4 断开消息的 next 指针，防止内存泄漏
                     msg.next = null;
+                    
+                    // 9.5 标记消息正在使用中
+                    msg.markInUse();
+                    
+                    // 9.6 返回消息给 Looper 处理
                     return msg;
+                }
+            } else {
+                // 10. 没有找到可执行的消息（队列为空或只有同步屏障且没有异步消息）
+                nextPollTimeoutMillis = -1;  // 无限阻塞，直到有新消息
+            }
+            
+            // 11. 处理 IdleHandler（只在第一次循环且没有立即可执行的消息时处理）
+            if (pendingIdleHandlerCount < 0 && (mMessages == null || now < mMessages.when)) {
+                // 11.1 计算待处理的 IdleHandler 数量
+                pendingIdleHandlerCount = mIdleHandlers.size();
+            }
+            
+            // 12. 如果没有待处理的 IdleHandler，继续下一次循环
+            if (pendingIdleHandlerCount <= 0) {
+                // 没有 IdleHandler，标记为阻塞状态，继续循环
+                mBlocked = true;
+                continue;
+            }
+            
+            // 13. 有 IdleHandler 需要处理
+            if (mPendingIdleHandlers == null) {
+                // 13.1 初始化 IdleHandler 数组（最多 4 个）
+                mPendingIdleHandlers = new IdleHandler[Math.max(pendingIdleHandlerCount, 4)];
+            }
+            // 13.2 将 IdleHandler 列表转换为数组（便于遍历和修改）
+            mPendingIdleHandlers = mIdleHandlers.toArray(mPendingIdleHandlers);
+        }
+        
+        // 14. 执行 IdleHandler（在锁外执行，避免阻塞消息队列）
+        for (int i = 0; i < pendingIdleHandlerCount; i++) {
+            final IdleHandler idler = mPendingIdleHandlers[i];
+            mPendingIdleHandlers[i] = null;  // 释放引用，防止内存泄漏
+            
+            boolean keep = false;
+            try {
+                // 14.1 调用 IdleHandler.queueIdle() 方法
+                //      - 返回 true：保留该 IdleHandler，下次空闲时继续调用
+                //      - 返回 false：移除该 IdleHandler，只执行一次
+                keep = idler.queueIdle();
+            } catch (Throwable t) {
+                Log.wtf(TAG, "IdleHandler threw exception", t);
+            }
+            
+            // 14.2 根据返回值决定是否保留 IdleHandler
+            if (!keep) {
+                synchronized (this) {
+                    mIdleHandlers.remove(idler);
                 }
             }
         }
+        
+        // 15. 重置计数，准备下一次循环
+        pendingIdleHandlerCount = 0;
+        
+        // 16. 重置超时时间，因为 IdleHandler 执行期间可能有新消息入队
+        nextPollTimeoutMillis = 0;
     }
 }
 ```
 
-**关键点**：
-- 消息按 `when` 时间排序
-- `next()` 会检查消息是否到时间（`now >= msg.when`）
-- 如果未到时间，会计算等待时间并阻塞
+**完整流程解析**：
+
+1. **初始化阶段**（第 1-2 行）：
+   - `pendingIdleHandlerCount = -1`：表示还未计算 IdleHandler 数量
+   - `nextPollTimeoutMillis = 0`：初始不阻塞，立即检查消息
+
+2. **阻塞等待阶段**（第 4 行）：
+   - 调用 `nativePollOnce()` 进入 Native 层
+   - 如果没有消息或消息时间未到，线程会通过 `epoll_wait` 进入休眠
+   - 当有新消息入队时，会通过 `nativeWake()` 唤醒线程
+
+3. **同步屏障处理**（第 8 行）：
+   - 如果队头消息的 `target == null`，说明是同步屏障
+   - 跳过所有同步消息，查找第一个异步消息
+   - 只有异步消息可以穿透同步屏障
+
+4. **消息时间判断**（第 9 行）：
+   - 如果 `now < msg.when`：消息时间未到，计算等待时间
+   - 如果 `now >= msg.when`：消息时间到了，从链表中移除并返回
+
+5. **IdleHandler 处理**（第 11-14 行）：
+   - 只在第一次循环且没有立即可执行的消息时处理
+   - 在锁外执行，避免阻塞消息队列
+   - 根据返回值决定是否保留 IdleHandler
+
+6. **退出检查**（第 7 行）：
+   - 如果 `mQuitting == true`，说明队列已退出
+   - 回收所有消息并返回 `null`，`Looper.loop()` 会退出
+
+**关键设计点**：
+
+- **线程安全**：所有对消息队列的修改都在 `synchronized` 块中
+- **性能优化**：IdleHandler 在锁外执行，避免阻塞消息处理
+- **内存管理**：及时断开消息的 `next` 指针，防止内存泄漏
+- **阻塞优化**：通过 `epoll` 机制实现真正的线程休眠，不占用 CPU
 
 #### 6.7.4 提高精确性的方法
 
