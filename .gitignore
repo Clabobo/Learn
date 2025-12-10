@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Build artifacts
+build/
+out/
+dist/
+.gradle/
+.cxx/
+
+# Android local config
+local.properties
+
+# Node
+node_modules/
+
+# Logs & temp
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Env
+.env
+.env.*
+
